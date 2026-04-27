@@ -1,0 +1,78 @@
+# =============================================================
+# Browser Control GRPO Training - Docker Compose
+# =============================================================
+# Container 1: training-gpu  → GRPO Trainer + vLLM (GPU)
+# Container 2: browsergym-env → BrowserGym/MiniWoB++ (CPU)
+# =============================================================
+
+services:
+  # ---------------------------------------------------------
+  # BrowserGym Environment (CPU only)
+  # Runs the MiniWoB++ click-test task as an HTTP API
+  # Must be started BEFORE the training container
+  # ---------------------------------------------------------
+  browsergym-env:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.browsergym
+    container_name: browsergym-env
+    volumes:
+      # Sync server script so code changes don't require rebuild
+      - ./docker/browsergym_server.py:/app/browsergym_server.py
+    ports:
+      - "7860:7860"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - browser-control-net
+
+  # ---------------------------------------------------------
+  # GRPO Training (GPU)
+  # Runs GRPOTrainer + colocated vLLM on your local GPU
+  # Connects to browsergym-env over Docker network
+  # ---------------------------------------------------------
+  training-gpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.training
+    container_name: training-gpu
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - CONFIG_FILE=${CONFIG_FILE:-qwen2_0.5b_lora.yaml}
+      - BROWSERGYM_URL=http://browsergym-env:7860
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+    volumes:
+      # Persist HuggingFace model cache across runs
+      - hf-cache:/hf_model_cache
+      # Persist model checkpoints
+      - model-checkpoints:/model_checkpoints
+      # Sync source code and configs so changes don't require rebuild
+      - ./src:/app/src
+      - ./configs:/app/configs
+    depends_on:
+      browsergym-env:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - browser-control-net
+
+networks:
+  browser-control-net:
+    driver: bridge
+
+volumes:
+  hf-cache:
+  model-checkpoints:

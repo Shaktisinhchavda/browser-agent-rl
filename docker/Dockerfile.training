@@ -1,0 +1,66 @@
+# =============================================================
+# Training container: GRPO Trainer + vLLM (colocated on GPU)
+# Runs Qwen2.5-0.5B with LoRA/QLoRA fine-tuning
+# Uses uv for fast dependency management
+# =============================================================
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+# Prevent interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    git \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.11 the default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Set HuggingFace cache to a volume-mountable path
+ENV HF_HOME=/hf_model_cache
+ENV PYTHONUNBUFFERED=1
+ENV UV_SYSTEM_PYTHON=1
+
+# Copy project files first for layer caching
+WORKDIR /app
+COPY pyproject.toml .python-version ./
+
+# Install dependencies with uv (no cache to save space)
+RUN uv pip install --no-cache torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+RUN uv pip install --no-cache \
+    "trl[vllm]>=0.12.0" \
+    "transformers>=4.45.0" \
+    "accelerate>=0.34.0" \
+    "peft>=0.13.0" \
+    "bitsandbytes>=0.43.0" \
+    "datasets>=3.0.0" \
+    "wandb>=0.16.0" \
+    "liger-kernel>=0.4.0" \
+    "pydantic>=2.0.0" \
+    "pydantic-settings>=2.0.0" \
+    "pyyaml>=6.0" \
+    "requests>=2.31.0" \
+    "numpy>=1.26.0" \
+    "pillow>=10.0.0" \
+    && rm -rf /root/.cache/uv
+
+# Copy project source code
+COPY configs/ configs/
+COPY src/ src/
+
+# Set PYTHONPATH so python can find the src directory
+ENV PYTHONPATH=/app/src
+
+# Default: run LoRA fine-tuning
+ENV CONFIG_FILE=qwen2_0.5b_lora.yaml
+CMD ["sh", "-c", "python -m browser_control.fine_tune ${CONFIG_FILE}"]

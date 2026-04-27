@@ -1,0 +1,43 @@
+[project]
+name = "browser-control"
+version = "0.1.0"
+description = "Fine-tune LLM for browser control using GRPO + RL"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets",
+    "numpy",
+    "requests",
+    "transformers",
+    "trl[vllm]",
+    "pillow",
+    "pydantic",
+    "pydantic-settings",
+    "wandb",
+    "peft",
+    "bitsandbytes",
+    "accelerate",
+    "pyyaml",
+    "liger-kernel",
+    "browsergym",
+    "browsergym-miniwob",
+    "playwright",
+    "fastapi",
+    "uvicorn[standard]",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/browser_control"]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true

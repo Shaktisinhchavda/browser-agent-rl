@@ -1,0 +1,41 @@
+# =============================================================
+# BrowserGym Environment Container (CPU only)
+# Runs the MiniWoB++ click-test task as an OpenEnv server
+# Uses official Playwright image to avoid dependency issues
+# =============================================================
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
+
+# Install uv + git
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONUNBUFFERED=1
+ENV UV_SYSTEM_PYTHON=1
+
+# Install Python dependencies with uv
+RUN uv pip install --no-cache \
+    "browsergym>=0.10.0" \
+    "browsergym-miniwob>=0.10.0" \
+    "fastapi>=0.104.0" \
+    "uvicorn[standard]>=0.24.0" \
+    "pydantic>=2.0.0" \
+    && rm -rf /root/.cache/uv
+
+# Clone MiniWoB++ HTML task files (this is what BrowserGym navigates to)
+RUN git clone https://github.com/Farama-Foundation/miniwob-plusplus.git /opt/miniwob-plusplus
+
+# Set MINIWOB_URL to point to the local HTML files (trailing slash required)
+ENV MINIWOB_URL="file:///opt/miniwob-plusplus/miniwob/html/miniwob/"
+
+WORKDIR /app
+
+# Copy the BrowserGym server script
+COPY docker/browsergym_server.py .
+
+# Expose the OpenEnv server port
+EXPOSE 7860
+
+# Start the BrowserGym OpenEnv server
+CMD ["python", "browsergym_server.py"]
