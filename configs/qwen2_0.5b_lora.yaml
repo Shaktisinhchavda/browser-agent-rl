@@ -6,46 +6,35 @@
 seed: 42
 
 # Language Model parameters
-model_name: Qwen/Qwen2.5-0.5B
+model_name: Qwen/Qwen2.5-0.5B-Instruct
 max_seq_length: 1024
 system_prompt: |
-  You control a web browser through BrowserGym actions.
-  You must complete the given web task by interacting with the page.
+  You control a web browser. Given the page structure below,
+  respond with exactly ONE action.
 
-  Available actions:
-  - noop() - Do nothing
-  - click(bid) - Click element with BrowserGym ID (the number in brackets)
-  - fill(bid, text) - Fill input field with text
-  - send_keys(text) - Send keyboard input
-  - scroll(direction) - Scroll up/down
+  Actions: click(bid), fill(bid, text), noop()
 
-  The page structure shows elements as: [bid] element_type 'element_text'
-  For example: [13] button 'Click Me!' means bid='13'
+  Example: if you see [13] button 'Submit', respond: click('13')
 
-  Reply with exactly ONE action on a single line, e.g.:
-  click('13')
-  fill('42', 'hello world')
-  noop()
-
-  Do not include explanations or multiple actions.
+  Respond with ONLY the action, nothing else.
 
 # BrowserGym environment
 browsergym_url: http://browsergym-env:7860
-dataset_size: 50
-default_goal: Complete the web task successfully.
+dataset_size: 200
+default_goal: Click the button.
 
-# Training hyperparameters (tuned for LoRA + 4GB VRAM)
-learning_rate: 1.0e-4
-warmup_steps: 5
+# Training hyperparameters
+learning_rate: 5.0e-4
+warmup_steps: 10
 
-# vLLM inference (memory-constrained settings)
+# Generation settings — more generations = better GRPO signal
 per_device_train_batch_size: 1
-num_generations: 2
-generation_batch_size: 2
+num_generations: 4
+generation_batch_size: 4
 max_steps: 5
-max_completion_length: 32
+max_completion_length: 16
 
-# vLLM disabled — use standard model.generate() to avoid OOM on 4GB VRAM
+# vLLM disabled for 4GB VRAM safety
 use_vllm: false
 vllm_mode: "colocate"
 vllm_gpu_memory_utilization: 0.3
@@ -55,7 +44,7 @@ use_4bit: true
 bnb_4bit_compute_dtype: "float16"
 bnb_4bit_quant_type: "nf4"
 
-# LoRA configuration (ENABLED)
+# LoRA configuration
 use_peft: true
 lora_r: 8
 lora_alpha: 16

@@ -6,12 +6,16 @@ that the GRPO trainer can connect to.
 
 This runs inside the browsergym-env Docker container (CPU only).
 The trainer container connects to this over the Docker network.
+
+IMPORTANT: All Playwright operations run in a single dedicated thread
+to avoid event loop conflicts with FastAPI's thread pool.
 """
 
-import json
 import logging
 import os
 import traceback
+import threading
+import queue
 from typing import Optional
 
 import browsergym.miniwob  # registers MiniWoB environments
@@ -25,11 +29,81 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="BrowserGym OpenEnv Server")
 
-# Global environment reference
-env: Optional[gym.Env] = None
-current_obs = None
-current_info = None
 
+# ---------------------------------------------------------------
+# Playwright Thread — all gym/browser ops happen in ONE thread
+# ---------------------------------------------------------------
+
+class PlaywrightWorker:
+    """
+    Runs all BrowserGym/Playwright operations in a single dedicated thread.
+    This prevents 'no running event loop' errors caused by FastAPI's
+    thread pool recycling threads between requests.
+    """
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self.env = None
+
+    def _run(self):
+        """Worker loop — processes one task at a time."""
+        while True:
+            func, args, result_queue = self._queue.get()
+            try:
+                result = func(*args)
+                result_queue.put(("ok", result))
+            except Exception as e:
+                result_queue.put(("error", e))
+
+    def submit(self, func, *args):
+        """Submit work to the Playwright thread and wait for result."""
+        result_queue = queue.Queue()
+        self._queue.put((func, args, result_queue))
+        status, result = result_queue.get(timeout=120)
+        if status == "error":
+            raise result
+        return result
+
+    def do_reset(self, task_name: str, seed: int):
+        """Reset the environment (runs in Playwright thread)."""
+        if self.env is not None:
+            try:
+                self.env.close()
+            except Exception:
+                pass
+
+        logger.info(f"Creating environment: {task_name}")
+        self.env = gym.make(task_name, headless=True, slow_mo=0)
+        obs, info = self.env.reset(seed=seed)
+        return obs, info
+
+    def do_step(self, action_str: str):
+        """Execute an action (runs in Playwright thread)."""
+        if self.env is None:
+            raise RuntimeError("Environment not initialized")
+        obs, reward, terminated, truncated, info = self.env.step(action_str)
+        done = terminated or truncated
+        return obs, reward, done, info
+
+    def do_close(self):
+        """Close the environment (runs in Playwright thread)."""
+        if self.env is not None:
+            try:
+                self.env.close()
+            except Exception:
+                pass
+            self.env = None
+
+
+# Create the single worker
+worker = PlaywrightWorker()
+
+
+# ---------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------
 
 class ResetRequest(BaseModel):
     task_name: str = "browsergym/miniwob.click-test"
@@ -43,7 +117,7 @@ class StepRequest(BaseModel):
 class ObservationResponse(BaseModel):
     goal: Optional[str] = None
     axtree_txt: Optional[str] = None
-    screenshot: Optional[list] = None  # Flattened pixel array
+    screenshot: Optional[list] = None
     error: Optional[str] = None
     last_action_error: bool = False
 
@@ -66,13 +140,8 @@ def extract_observation(obs: dict, info: dict) -> ObservationResponse:
     last_action_error = bool(obs.get("last_action_error", False))
     error = str(obs.get("last_action_error", "")) if last_action_error else None
 
-    # Screenshot as list (optional — skip for text-only mode to save bandwidth)
+    # Skip screenshots to save bandwidth
     screenshot = None
-    if "screenshot" in obs and obs["screenshot"] is not None:
-        try:
-            screenshot = obs["screenshot"].tolist()
-        except Exception:
-            screenshot = None
 
     return ObservationResponse(
         goal=goal,
@@ -83,6 +152,10 @@ def extract_observation(obs: dict, info: dict) -> ObservationResponse:
     )
 
 
+# ---------------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------------
+
 @app.get("/health")
 def health():
     """Health check endpoint."""
@@ -92,33 +165,11 @@ def health():
 @app.post("/reset", response_model=ResetResponse)
 def reset(request: ResetRequest):
     """Reset the BrowserGym environment and return initial observation."""
-    global env, current_obs, current_info
-
     try:
-        # Close existing environment if any
-        if env is not None:
-            try:
-                env.close()
-            except Exception:
-                pass
-
-        logger.info(f"Creating environment: {request.task_name}")
-
-        # Create BrowserGym environment
-        env = gym.make(
-            request.task_name,
-            headless=True,
-            slow_mo=0,
-        )
-
-        # Reset and get initial observation
         seed = request.seed or int.from_bytes(os.urandom(4), "big") % (2**31)
-        obs, info = env.reset(seed=seed)
-        current_obs = obs
-        current_info = info
+        obs, info = worker.submit(worker.do_reset, request.task_name, seed)
 
         observation = extract_observation(obs, info)
-
         logger.info(f"Environment reset. Goal: {observation.goal}")
 
         return ResetResponse(observation=observation, done=False)
@@ -131,22 +182,11 @@ def reset(request: ResetRequest):
 @app.post("/step", response_model=StepResponse)
 def step(request: StepRequest):
     """Execute an action in the BrowserGym environment."""
-    global env, current_obs, current_info
-
-    if env is None:
-        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
-
     try:
         logger.info(f"Executing action: {request.action_str}")
+        obs, reward, done, info = worker.submit(worker.do_step, request.action_str)
 
-        # Execute the action
-        obs, reward, terminated, truncated, info = env.step(request.action_str)
-        current_obs = obs
-        current_info = info
-
-        done = terminated or truncated
         observation = extract_observation(obs, info)
-
         logger.info(f"Step result: reward={reward}, done={done}")
 
         return StepResponse(
@@ -163,12 +203,10 @@ def step(request: StepRequest):
 @app.on_event("shutdown")
 def shutdown():
     """Cleanup on server shutdown."""
-    global env
-    if env is not None:
-        try:
-            env.close()
-        except Exception:
-            pass
+    try:
+        worker.submit(worker.do_close)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

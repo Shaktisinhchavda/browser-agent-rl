@@ -66,53 +66,78 @@ def parse_action(response_text: str) -> str:
 
 def make_reward_func(client: BrowserGymClient, system_prompt: str, max_steps: int):
     """
-    Create a reward function that:
-    1. Takes model-generated completions (actions)
-    2. Executes them in the BrowserGym environment
-    3. Returns rewards based on task success
+    Shaped reward function — v3 (fixes click('') shortcut).
+
+    The model already learned click() format. Now it needs to learn to
+    extract the correct bid from the page structure.
+
+    Reward ladder:
+      0.0   — gibberish or noop
+      0.05  — contains action keyword
+      0.1   — click with empty bid: click('') — penalized!
+      0.3   — click with an actual bid: click('13')
+      0.5   — click with a bid that exists in the page
+      1.0   — task actually completed in the environment
     """
+    import re
 
-    def reward_func(completions: list[list[dict]], **kwargs) -> list[float]:
-        """
-        Reward function called by GRPOTrainer.
-
-        For each completion, we:
-        - Parse the action from the model output
-        - Execute it in the BrowserGym environment
-        - Return the reward (1.0 for success, 0.0 for failure)
-        """
+    def reward_func(completions: list[list[dict]], prompts=None, **kwargs) -> list[float]:
         rewards = []
 
-        for completion_messages in completions:
-            # Extract the generated text from the completion
+        for idx, completion_messages in enumerate(completions):
             if isinstance(completion_messages, list):
-                # Chat format: list of message dicts
                 generated_text = completion_messages[-1].get("content", "")
             elif isinstance(completion_messages, str):
                 generated_text = completion_messages
             else:
                 generated_text = str(completion_messages)
 
-            # Parse the action
-            action_str = parse_action(generated_text)
+            raw_text = generated_text.strip()
+            action_str = parse_action(raw_text)
 
-            try:
-                # Reset the environment for each evaluation
-                result = client.reset()
+            # --- Reward ladder ---
+            reward = 0.0
 
-                # Execute the action
-                if not result.done:
-                    result = client.step(action_str)
+            # Level 1: Contains action keyword
+            if any(kw in raw_text.lower() for kw in ["click", "fill", "scroll"]):
+                reward = 0.05
 
-                # Reward: 1.0 if task completed successfully, 0.0 otherwise
-                reward = 1.0 if result.reward > 0 else 0.0
+            # Level 2: click() with empty bid — learned format but lazy
+            if action_str.startswith("click(") and action_str in ("click('')", 'click("")', "click()"):
+                reward = 0.1  # Penalized vs having a real bid
 
-            except Exception as e:
-                print(f"  ⚠ Environment error: {e}")
-                reward = 0.0
+            # Level 3: click() with an actual bid value
+            bid_match = re.search(r"click\(['\"](\d+)['\"]\)", action_str)
+            if bid_match:
+                reward = 0.3
+                bid_value = bid_match.group(1)
+
+                # Level 4: bid exists in the prompt context (model read the page)
+                # Get the prompt for this completion to check bid validity
+                prompt_text = ""
+                if prompts and idx < len(prompts):
+                    p = prompts[idx]
+                    if isinstance(p, list):
+                        prompt_text = " ".join(m.get("content", "") for m in p)
+                    else:
+                        prompt_text = str(p)
+
+                if f"[{bid_value}]" in prompt_text:
+                    reward = 0.5
+
+            # Level 5: Execute in environment for actual task reward
+            if action_str != "noop()" and action_str not in ("click('')", 'click("")', "click()"):
+                try:
+                    result = client.reset()
+                    if not result.done:
+                        result = client.step(action_str)
+                    if result.reward > 0:
+                        reward = 1.0
+                except Exception:
+                    pass  # Keep format-based reward
 
             rewards.append(reward)
-            print(f"  Action: {action_str} → Reward: {reward}")
+            print(f"  Raw: {raw_text[:60]!r} → Action: {action_str} → R: {reward}")
 
         return rewards
 
