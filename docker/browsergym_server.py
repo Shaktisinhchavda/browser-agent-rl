@@ -13,6 +13,7 @@ to avoid event loop conflicts with FastAPI's thread pool.
 
 import logging
 import os
+from browsergym.utils.obs import flatten_axtree_to_str
 import traceback
 import threading
 import queue
@@ -136,7 +137,16 @@ class StepResponse(BaseModel):
 def extract_observation(obs: dict, info: dict) -> ObservationResponse:
     """Extract relevant fields from BrowserGym observation."""
     goal = obs.get("goal", "")
-    axtree_txt = obs.get("axtree_txt", "")
+
+    # Convert axtree_object (dict) to readable text like:
+    # RootWebArea 'Click Test Task'
+    #     [13] button 'Click Me!'
+    axtree_object = obs.get("axtree_object", None)
+    if axtree_object:
+        axtree_txt = flatten_axtree_to_str(axtree_object)
+    else:
+        axtree_txt = ""
+
     last_action_error = bool(obs.get("last_action_error", False))
     error = str(obs.get("last_action_error", "")) if last_action_error else None
 

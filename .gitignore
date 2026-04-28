@@ -16,9 +16,12 @@ uv.lock
 checkpoints/
 model_checkpoints/
 
-# Media/screenshots
-media/*.png
+# Runtime screenshots (not README images)
+media/episode_*.png
 
 # IDE
 .vscode/
 .idea/
+
+# WandB logs
+wandb/

@@ -97,6 +97,7 @@ def evaluate(
             error = observation.error if observation.last_action_error else ""
 
             user_prompt = make_user_prompt(goal, step_num, axtree, error)
+
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -114,7 +115,7 @@ def evaluate(
             generated_text = tokenizer.decode(output_ids, skip_special_tokens=True)
 
             action_str = parse_action(generated_text)
-            print(f"  Step {step_num + 1}: {action_str}")
+            print(f"  Step {step_num + 1}: raw={generated_text[:80]!r} → {action_str}")
 
             # Execute action
             result = client.step(action_str)
@@ -148,24 +149,34 @@ def main():
     config_file = sys.argv[1]
     model_path = sys.argv[2] if len(sys.argv) > 2 else None
 
+    # Check for --sft-checkpoint flag
+    sft_checkpoint = None
+    if "--sft-checkpoint" in sys.argv:
+        idx = sys.argv.index("--sft-checkpoint")
+        if idx + 1 < len(sys.argv):
+            sft_checkpoint = sys.argv[idx + 1]
+
     config = FineTuningConfig.from_yaml(file_name=config_file)
 
-    # Load model
-    model_name = model_path or config.model_name
-    print(f"Loading model: {model_name}")
-
+    # Load base model
+    print(f"Loading base model: {config.model_name}")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        config.model_name,
         torch_dtype="auto",
         device_map="auto",
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model_name  # Always load tokenizer from base model
-    )
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
-    # If there's a LoRA adapter to load
+    # Stage 1: Merge SFT LoRA if provided
+    if sft_checkpoint:
+        print(f"Loading and merging SFT LoRA from {sft_checkpoint}")
+        model = PeftModel.from_pretrained(model, sft_checkpoint)
+        model = model.merge_and_unload()
+        print("SFT LoRA merged into base model")
+
+    # Stage 2: Apply GRPO LoRA if provided
     if model_path and config.use_peft:
-        print(f"Loading LoRA adapter from {model_path}")
+        print(f"Loading GRPO LoRA adapter from {model_path}")
         model = PeftModel.from_pretrained(model, model_path)
 
     # Connect to BrowserGym

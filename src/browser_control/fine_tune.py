@@ -4,11 +4,11 @@ GRPO Fine-tuning for Browser Control
 This is the core training script. It:
 1. Connects to the BrowserGym environment (running in a separate Docker container)
 2. Uses GRPOTrainer from HuggingFace TRL for policy optimization
-3. Optionally uses vLLM (colocated on GPU) for fast rollout generation
-4. Logs everything to WandB
+3. Logs everything to WandB
 
-Adapted from Liquid4All/cookbook browser-control example,
-but runs locally on your own GPU instead of Modal.
+Adapted from Liquid4All/cookbook browser-control example.
+Note: rollout_func requires vLLM (unavailable on 4GB VRAM),
+so we use standard GRPO with environment-based reward instead.
 """
 
 import os
@@ -26,7 +26,7 @@ from .paths import get_path_model_checkpoints
 
 
 # ---------------------------------------------------------------------------
-# Prompt construction & action parsing
+# Prompt construction & action parsing (same as reference repo)
 # ---------------------------------------------------------------------------
 
 def make_user_prompt(goal: str, step_num: int, axtree: str, error: str = "") -> str:
@@ -41,7 +41,7 @@ def make_user_prompt(goal: str, step_num: int, axtree: str, error: str = "") -> 
 
     # Include accessibility tree (truncated to fit context)
     if axtree:
-        max_len = 1500  # Conservative for 0.5B model with 1024 context
+        max_len = 2000
         axtree_truncated = axtree[:max_len] + "..." if len(axtree) > max_len else axtree
         prompt_parts.append(f"Page structure:\n{axtree_truncated}")
 
@@ -61,72 +61,54 @@ def parse_action(response_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reward function (used by GRPOTrainer)
+# Reward function: runs action in environment + shaped bonus
 # ---------------------------------------------------------------------------
 
 def make_reward_func(client: BrowserGymClient, system_prompt: str, max_steps: int):
     """
-    Shaped reward function — v3 (fixes click('') shortcut).
+    Reward function for GRPO that executes actions in BrowserGym.
 
-    The model already learned click() format. Now it needs to learn to
-    extract the correct bid from the page structure.
-
-    Reward ladder:
-      0.0   — gibberish or noop
-      0.05  — contains action keyword
-      0.1   — click with empty bid: click('') — penalized!
-      0.3   — click with an actual bid: click('13')
-      0.5   — click with a bid that exists in the page
-      1.0   — task actually completed in the environment
+    Returns 1.0 for task success, with shaped bonuses for valid actions.
     """
     import re
 
-    def reward_func(completions: list[list[dict]], prompts=None, **kwargs) -> list[float]:
+    def reward_func(completions, **kwargs) -> list[float]:
         rewards = []
 
-        for idx, completion_messages in enumerate(completions):
-            if isinstance(completion_messages, list):
-                generated_text = completion_messages[-1].get("content", "")
-            elif isinstance(completion_messages, str):
-                generated_text = completion_messages
+        for completion in completions:
+            # Extract generated text
+            if isinstance(completion, list):
+                text = completion[-1].get("content", "")
+            elif isinstance(completion, str):
+                text = completion
             else:
-                generated_text = str(completion_messages)
+                text = str(completion)
 
-            raw_text = generated_text.strip()
-            action_str = parse_action(raw_text)
+            raw = text.strip()
+            action_str = parse_action(raw)
 
-            # --- Reward ladder ---
+            # Shaped reward ladder
             reward = 0.0
 
-            # Level 1: Contains action keyword
-            if any(kw in raw_text.lower() for kw in ["click", "fill", "scroll"]):
+            # Has action keyword
+            if any(kw in raw.lower() for kw in ["click", "fill", "scroll"]):
                 reward = 0.05
 
-            # Level 2: click() with empty bid — learned format but lazy
-            if action_str.startswith("click(") and action_str in ("click('')", 'click("")', "click()"):
-                reward = 0.1  # Penalized vs having a real bid
+            # Has parentheses (action-like format)
+            if "(" in raw and ")" in raw:
+                reward = 0.1
 
-            # Level 3: click() with an actual bid value
+            # Valid parseable action
+            if action_str != "noop()":
+                reward = 0.2
+
+            # Click with a real bid number
             bid_match = re.search(r"click\(['\"](\d+)['\"]\)", action_str)
             if bid_match:
-                reward = 0.3
-                bid_value = bid_match.group(1)
+                reward = 0.5
 
-                # Level 4: bid exists in the prompt context (model read the page)
-                # Get the prompt for this completion to check bid validity
-                prompt_text = ""
-                if prompts and idx < len(prompts):
-                    p = prompts[idx]
-                    if isinstance(p, list):
-                        prompt_text = " ".join(m.get("content", "") for m in p)
-                    else:
-                        prompt_text = str(p)
-
-                if f"[{bid_value}]" in prompt_text:
-                    reward = 0.5
-
-            # Level 5: Execute in environment for actual task reward
-            if action_str != "noop()" and action_str not in ("click('')", 'click("")', "click()"):
+            # Execute in environment for full reward
+            if bid_match:
                 try:
                     result = client.reset()
                     if not result.done:
@@ -134,14 +116,54 @@ def make_reward_func(client: BrowserGymClient, system_prompt: str, max_steps: in
                     if result.reward > 0:
                         reward = 1.0
                 except Exception:
-                    pass  # Keep format-based reward
+                    pass
 
             rewards.append(reward)
-            print(f"  Raw: {raw_text[:60]!r} → Action: {action_str} → R: {reward}")
+            print(f"  [{raw[:50]!r}] → {action_str} → R:{reward}")
 
         return rewards
 
     return reward_func
+
+
+# ---------------------------------------------------------------------------
+# Build training dataset with one-shot example
+# ---------------------------------------------------------------------------
+
+def build_dataset(config: FineTuningConfig, client: BrowserGymClient) -> Dataset:
+    """
+    Build training dataset: collect page observations from BrowserGym.
+    No one-shot example — system prompt already explains the format.
+    """
+    prompts = []
+
+    for i in range(config.dataset_size):
+        try:
+            result = client.reset()
+            obs = result.observation
+
+            goal = obs.goal or config.default_goal
+            axtree = obs.axtree_txt or ""
+
+            user_prompt = make_user_prompt(goal, step_num=0, axtree=axtree)
+
+            messages = [
+                {"role": "system", "content": config.system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            prompts.append(messages)
+
+        except Exception as e:
+            print(f"  ⚠ Failed to collect prompt {i}: {e}")
+            messages = [
+                {"role": "system", "content": config.system_prompt},
+                {"role": "user", "content": f"Step 1\n\nGoal: {config.default_goal}\n\nWhat action do you take?"},
+            ]
+            prompts.append(messages)
+
+    print(f"Collected {len(prompts)} training prompts from BrowserGym")
+
+    return Dataset.from_dict({"prompt": prompts})
 
 
 # ---------------------------------------------------------------------------
@@ -179,53 +201,8 @@ def create_quantization_config(config: FineTuningConfig) -> BitsAndBytesConfig |
         load_in_4bit=True,
         bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_quant_type=config.bnb_4bit_quant_type,
-        bnb_4bit_use_double_quant=True,  # Nested quantization for extra memory savings
+        bnb_4bit_use_double_quant=True,
     )
-
-
-# ---------------------------------------------------------------------------
-# Build training dataset
-# ---------------------------------------------------------------------------
-
-def build_dataset(config: FineTuningConfig, client: BrowserGymClient) -> Dataset:
-    """
-    Build a training dataset of prompts for GRPO.
-
-    Each prompt contains the system prompt + a browser observation
-    from a fresh environment reset.
-    """
-    prompts = []
-
-    for i in range(config.dataset_size):
-        try:
-            result = client.reset()
-            obs = result.observation
-
-            goal = obs.goal or config.default_goal
-            axtree = obs.axtree_txt or ""
-
-            user_prompt = make_user_prompt(goal, step_num=0, axtree=axtree)
-
-            # Build chat-format prompt
-            messages = [
-                {"role": "system", "content": config.system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-
-            prompts.append(messages)
-
-        except Exception as e:
-            print(f"  ⚠ Failed to collect prompt {i}: {e}")
-            # Fallback prompt
-            messages = [
-                {"role": "system", "content": config.system_prompt},
-                {"role": "user", "content": f"Goal: {config.default_goal}\n\nWhat action do you take?"},
-            ]
-            prompts.append(messages)
-
-    print(f"Collected {len(prompts)} training prompts from BrowserGym")
-
-    return Dataset.from_dict({"prompt": prompts})
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +212,6 @@ def build_dataset(config: FineTuningConfig, client: BrowserGymClient) -> Dataset
 def fine_tune(config: FineTuningConfig) -> None:
     """
     Fine-tune a language model for browser control using GRPO.
-
-    This replaces the Modal-based approach from the reference repo
-    with direct local GPU execution via Docker.
     """
     # --- WandB setup ---
     if config.wandb_enabled:
@@ -255,18 +229,15 @@ def fine_tune(config: FineTuningConfig) -> None:
     print(f"Connecting to BrowserGym at {config.browsergym_url}")
     client = BrowserGymClient(base_url=config.browsergym_url)
 
-    # Verify connection
     try:
         health = client.health()
         print(f"BrowserGym server is healthy: {health}")
     except Exception as e:
         print(f"❌ Cannot connect to BrowserGym at {config.browsergym_url}")
         print(f"   Error: {e}")
-        print(f"   Make sure the browsergym-env container is running:")
-        print(f"   docker compose up browsergym-env -d")
         sys.exit(1)
 
-    # --- Build training dataset (prompts from BrowserGym) ---
+    # --- Build training dataset (prompts with one-shot example) ---
     print("Collecting training prompts from BrowserGym...")
     dataset = build_dataset(config, client)
 
@@ -274,7 +245,7 @@ def fine_tune(config: FineTuningConfig) -> None:
     output_dir = get_path_model_checkpoints(config.wandb_experiment_name)
     print(f"Checkpoints will be saved to: {output_dir}")
 
-    # --- Build quantization config (QLoRA) ---
+    # --- Build quantization config ---
     quant_config = create_quantization_config(config)
     if quant_config:
         print("4-bit quantization enabled (QLoRA mode)")
@@ -294,9 +265,9 @@ def fine_tune(config: FineTuningConfig) -> None:
         report_to="wandb" if config.wandb_enabled else "none",
         seed=config.seed,
         remove_unused_columns=False,
+        temperature=1.5,  # Higher temp = more diverse generations for GRPO exploration
     )
 
-    # vLLM settings (only when enabled — requires Linux + GPU)
     if config.use_vllm:
         grpo_kwargs["use_vllm"] = True
         grpo_kwargs["vllm_mode"] = config.vllm_mode
@@ -304,10 +275,9 @@ def fine_tune(config: FineTuningConfig) -> None:
         print(f"vLLM enabled: mode={config.vllm_mode}, "
               f"gpu_mem={config.vllm_gpu_memory_utilization}")
 
-    # Add gradient checkpointing if enabled
     if config.gradient_checkpointing:
         grpo_kwargs["gradient_checkpointing"] = True
-        print("Gradient checkpointing enabled (saves VRAM, slower training)")
+        print("Gradient checkpointing enabled")
 
     grpo_config = GRPOConfig(**grpo_kwargs)
 
@@ -317,20 +287,35 @@ def fine_tune(config: FineTuningConfig) -> None:
         print(f"LoRA enabled: r={config.lora_r}, alpha={config.lora_alpha}")
         print(f"Target modules: {config.lora_target_modules}")
 
-    # --- Build model kwargs (for quantization) ---
+    # --- Model kwargs ---
     model_kwargs = {}
     if quant_config:
         model_kwargs["quantization_config"] = quant_config
 
-    # --- Create reward function ---
+    # --- Reward function ---
     reward_fn = make_reward_func(client, config.system_prompt, config.max_steps)
 
-    # --- Load Model Manually (to handle quantization without model_init_kwargs) ---
-    print(f"Loading model {config.model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        **model_kwargs
-    )
+    # --- Load model (optionally from SFT warmup checkpoint) ---
+    sft_checkpoint = None
+    if len(sys.argv) > 3 and sys.argv[2] == "--sft-checkpoint":
+        sft_checkpoint = sys.argv[3]
+
+    if sft_checkpoint:
+        from peft import PeftModel
+        print(f"Loading base model {config.model_name}...")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name, **model_kwargs
+        )
+        print(f"Loading SFT warmup LoRA from {sft_checkpoint}...")
+        model = PeftModel.from_pretrained(base_model, sft_checkpoint)
+        model = model.merge_and_unload()  # Merge LoRA into base for fresh GRPO LoRA
+        print("SFT LoRA merged into base model. GRPO will add fresh LoRA on top.")
+    else:
+        print(f"Loading model {config.model_name}...")
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            **model_kwargs
+        )
 
     # --- Create GRPOTrainer ---
     print(f"Setting up GRPOTrainer with model: {config.model_name}")
@@ -357,11 +342,8 @@ def fine_tune(config: FineTuningConfig) -> None:
         print("Saving LoRA adapter weights only")
     trainer.save_model(output_dir)
 
-    # --- Optionally push to HF Hub ---
     if config.push_to_hf:
         print("Pushing model to HuggingFace Hub...")
-        if config.use_peft:
-            print("Note: Pushing LoRA adapters only")
         trainer.push_to_hub()
 
     print("\n✅ Training complete!")
@@ -375,7 +357,6 @@ def main():
     """CLI entrypoint: python -m browser_control.fine_tune <config_file>"""
     if len(sys.argv) < 2:
         print("Usage: python -m browser_control.fine_tune <config_file.yaml>")
-        print("Example: python -m browser_control.fine_tune qwen2_0.5b_lora.yaml")
         sys.exit(1)
 
     config_file = sys.argv[1]

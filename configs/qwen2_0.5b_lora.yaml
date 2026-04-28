@@ -1,50 +1,60 @@
 #########################################################
-# Qwen2.5-0.5B with LoRA fine-tuning (4GB VRAM)
-# Recommended for consumer GPUs
+# Qwen2.5-0.5B-Instruct with LoRA fine-tuning
+# Matches reference repo settings (only model name differs)
 #########################################################
 
-seed: 42
+seed: 23
 
 # Language Model parameters
 model_name: Qwen/Qwen2.5-0.5B-Instruct
-max_seq_length: 1024
+max_seq_length: 2048
 system_prompt: |
-  You control a web browser. Given the page structure below,
-  respond with exactly ONE action.
+  You control a web browser through BrowserGym actions.
+  You must complete the given web task by interacting with the page.
 
-  Actions: click(bid), fill(bid, text), noop()
+  Available actions:
+  - noop() - Do nothing
+  - click(bid) - Click element with BrowserGym ID (the number in brackets)
+  - fill(bid, text) - Fill input field with text
+  - send_keys(text) - Send keyboard input
+  - scroll(direction) - Scroll up/down
 
-  Example: if you see [13] button 'Submit', respond: click('13')
+  The page structure shows elements as: [bid] element_type 'element_text'
+  Look at the [number] next to each element — that is its bid.
 
-  Respond with ONLY the action, nothing else.
+  Reply with exactly ONE action on a single line, e.g.:
+  click('<bid>')
+  fill('<bid>', '<text>')
+
+  Do not include explanations or multiple actions.
 
 # BrowserGym environment
 browsergym_url: http://browsergym-env:7860
-dataset_size: 200
+dataset_size: 100
 default_goal: Click the button.
 
-# Training hyperparameters
-learning_rate: 5.0e-4
+# Training hyperparameters (same as reference LoRA config)
+learning_rate: 1.0e-4
 warmup_steps: 10
 
-# Generation settings — more generations = better GRPO signal
+# Generation settings (match reference)
 per_device_train_batch_size: 1
 num_generations: 4
 generation_batch_size: 4
-max_steps: 5
-max_completion_length: 16
+max_steps: 10
+max_completion_length: 32
 
-# vLLM disabled for 4GB VRAM safety
+# vLLM disabled (4GB VRAM - reference uses A100)
 use_vllm: false
 vllm_mode: "colocate"
 vllm_gpu_memory_utilization: 0.3
 
-# 4-bit quantization for fitting in 4GB VRAM
-use_4bit: true
+# NO quantization - 0.5B model fits in fp16
+use_4bit: false
 bnb_4bit_compute_dtype: "float16"
 bnb_4bit_quant_type: "nf4"
 
-# LoRA configuration
+# LoRA configuration (same as reference)
 use_peft: true
 lora_r: 8
 lora_alpha: 16
@@ -60,7 +70,7 @@ lora_target_modules:
   - "up_proj"
   - "down_proj"
 
-# Gradient checkpointing (saves VRAM at cost of speed)
+# Gradient checkpointing
 gradient_checkpointing: true
 
 # Experiment tracking

@@ -2,32 +2,33 @@
 # Makefile for Browser Control GRPO Training
 # ============================================
 
-# Default config file
 CONFIG ?= qwen2_0.5b_lora.yaml
 
-# ---- Docker commands ----
-
-.PHONY: build up down train train-full env logs clean
+.PHONY: build up down sft train eval logs clean
 
 # Build all Docker images
 build:
 	docker compose build
 
-# Start BrowserGym environment only
-env:
-	docker compose up browsergym-env -d
+# Start all services
+up:
+	docker compose up -d
 
-# Start training (launches both containers)
+# Stop all containers
+down:
+	docker compose down
+
+# Step 1: SFT warmup (teaches model click('bid') format)
+sft:
+	docker compose run --rm training-gpu python -m browser_control.sft_warmup $(CONFIG)
+
+# Step 2: GRPO training (RL on top of SFT model)
 train:
-	CONFIG_FILE=$(CONFIG) docker compose up
+	docker compose run --rm training-gpu python -m browser_control.fine_tune $(CONFIG) --sft-checkpoint /model_checkpoints/Qwen2.5-0.5B-Instruct-sft-warmup
 
-# Start training in background
-train-bg:
-	CONFIG_FILE=$(CONFIG) docker compose up -d
-
-# Full fine-tune (not recommended for 4GB VRAM)
-train-full:
-	CONFIG_FILE=qwen2_0.5b_full.yaml docker compose up
+# Step 3: Evaluate (pass MODEL_PATH= and SFT_PATH=)
+eval:
+	docker compose run --rm training-gpu python -m browser_control.evaluate $(CONFIG) $(MODEL_PATH) --sft-checkpoint $(SFT_PATH)
 
 # View training logs
 logs:
@@ -37,46 +38,6 @@ logs:
 logs-env:
 	docker compose logs -f browsergym-env
 
-# Stop all containers
-down:
-	docker compose down
-
-# Remove everything (containers, volumes, images)
+# Remove everything
 clean:
 	docker compose down -v --rmi all
-
-# ---- Local development (with uv) ----
-
-.PHONY: install sync local-train local-eval lock
-
-# Install uv (if not already installed)
-install-uv:
-	curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create venv and install all dependencies
-sync:
-	uv sync
-
-# Generate/update uv.lock
-lock:
-	uv lock
-
-# Train locally (requires BrowserGym running separately)
-local-train:
-	uv run python -m browser_control.fine_tune $(CONFIG)
-
-# Evaluate a trained model
-local-eval:
-	uv run python -m browser_control.evaluate $(CONFIG) $(MODEL_PATH)
-
-# ---- Utilities ----
-
-.PHONY: check-gpu check-env
-
-# Check if GPU is available
-check-gpu:
-	nvidia-smi
-
-# Check if BrowserGym environment is running
-check-env:
-	curl -s http://localhost:7860/health | python -m json.tool
